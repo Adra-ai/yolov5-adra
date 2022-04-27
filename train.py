@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import math
+from multiprocessing.dummy import Namespace
 import os
 import random
 import sys
@@ -31,6 +32,8 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm import tqdm
+
+from hydra import compose, initialize
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -80,11 +83,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
 
     # Save run settings
+
     if not evolve:
+        opt_no_augs = vars(opt).copy()
+        opt_no_augs.pop("augmentations", None)
         with open(save_dir / 'hyp.yaml', 'w') as f:
             yaml.safe_dump(hyp, f, sort_keys=False)
         with open(save_dir / 'opt.yaml', 'w') as f:
-            yaml.safe_dump(vars(opt), f, sort_keys=False)
+            yaml.safe_dump(opt_no_augs, f, sort_keys=False)
 
     # Loggers
     data_dict = None
@@ -118,6 +124,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+
+        if opt.pretrained:
+            ckpt = {
+                'epoch': -1, 'model': ckpt, 'ema': None, 
+                'updates': None, 'optimizer': None, 'wandb_id': None, 
+                'training_results': None
+            }
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
@@ -232,7 +245,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                               image_weights=opt.image_weights,
                                               quad=opt.quad,
                                               prefix=colorstr('train: '),
-                                              shuffle=True)
+                                              shuffle=True,
+                                              opt=opt)
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max())  # max label class
     nb = len(train_loader)  # number of batches
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
@@ -398,7 +412,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                            compute_loss=compute_loss)
 
             # Update best mAP
-            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            fi = fitness(np.array(results).reshape(1, -1), opt.fitness)  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             if fi > best_fitness:
                 best_fitness = fi
             log_vals = list(mloss) + list(results) + lr
@@ -514,11 +528,42 @@ def parse_opt(known=False):
     parser.add_argument('--bbox_interval', type=int, default=-1, help='W&B: Set bounding-box image logging interval')
     parser.add_argument('--artifact_alias', type=str, default='latest', help='W&B: Version of dataset artifact to use')
 
+    # Dockerization argument
+    parser.add_argument('--yaml_conf', action='store_true', help='to use config.yaml inside config folder')
+    parser.add_argument('--pretrained', action='store_true', help='to use config.yaml inside config folder')
+
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 
 
+
+def retrieve_yaml_conf():
+    with initialize(config_path="config"):
+        cfg = compose(config_name="config")
+    return cfg
+
+
+def overwrite_opts(opt):
+    # Temporary convert Namespace to dictionary
+    tmp = vars(opt)
+    cfg = retrieve_yaml_conf()
+
+    training_dict = cfg['training']
+    for k, v in training_dict.items():
+        tmp[k] = v 
+
+    # Add augmentations
+    if cfg['augmentations']:
+        tmp['augmentations'] = cfg['augmentations']
+    return argparse.Namespace(**tmp)
+
+
 def main(opt, callbacks=Callbacks()):
+
+    # If override using YAML
+    if opt.yaml_conf:
+         opt = overwrite_opts(opt)
+
     # Checks
     if RANK in (-1, 0):
         print_args(vars(opt))
@@ -544,6 +589,12 @@ def main(opt, callbacks=Callbacks()):
         if opt.name == 'cfg':
             opt.name = Path(opt.cfg).stem  # use model.yaml as name
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
+
+    # Fitness
+    # See utils.metrics.fitness 
+    default_fitness = [0.0, 0.0, 0.1, 0.9]
+    model_fitness = opt.fitness if 'fitness' in opt else default_fitness
+    opt.fitness = list(model_fitness)
 
     # DDP mode
     device = select_device(opt.device, batch_size=opt.batch_size)
@@ -615,8 +666,8 @@ def main(opt, callbacks=Callbacks()):
                 parent = 'single'  # parent selection method: 'single' or 'weighted'
                 x = np.loadtxt(evolve_csv, ndmin=2, delimiter=',', skiprows=1)
                 n = min(5, len(x))  # number of previous results to consider
-                x = x[np.argsort(-fitness(x))][:n]  # top n mutations
-                w = fitness(x) - fitness(x).min() + 1E-6  # weights (sum > 0)
+                x = x[np.argsort(-fitness(x, w=opt.fitness))][:n]  # top n mutations
+                w = fitness(x, w=opt.fitness) - fitness(x, w=opt.fitness).min() + 1E-6  # weights (sum > 0)
                 if parent == 'single' or len(x) == 1:
                     # x = x[random.randint(0, n - 1)]  # random selection
                     x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
