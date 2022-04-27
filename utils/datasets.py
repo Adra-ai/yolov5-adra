@@ -108,7 +108,8 @@ def create_dataloader(path,
                       image_weights=False,
                       quad=False,
                       prefix='',
-                      shuffle=False):
+                      shuffle=False,
+                      opt={}):
     if rect and shuffle:
         LOGGER.warning('WARNING: --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
@@ -125,7 +126,8 @@ def create_dataloader(path,
             stride=int(stride),
             pad=pad,
             image_weights=image_weights,
-            prefix=prefix)
+            prefix=prefix,
+            opt=opt)
 
     batch_size = min(batch_size, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
@@ -423,7 +425,7 @@ class LoadImagesAndLabels(Dataset):
         self.path = path
 
         # Use albumentations from hydra conf
-        transforms = opt.get('augmentations', None)
+        transforms = opt.augmentations if 'augmentations' in opt else None
         self.albumentations = Albumentations(transforms=transforms) if augment else None
 
         try:

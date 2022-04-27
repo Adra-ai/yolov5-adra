@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import math
+from multiprocessing.dummy import Namespace
 import os
 import random
 import sys
@@ -32,8 +33,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm.auto import tqdm
 
-from omegaconf import DictConfig, OmegaConf
-import hydra
+from hydra import compose, initialize
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -83,11 +83,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
 
     # Save run settings
+
     if not evolve:
+        opt_no_augs = vars(opt).copy()
+        opt_no_augs.pop("augmentations", None)
         with open(save_dir / 'hyp.yaml', 'w') as f:
             yaml.safe_dump(hyp, f, sort_keys=False)
         with open(save_dir / 'opt.yaml', 'w') as f:
-            yaml.safe_dump(vars(opt), f, sort_keys=False)
+            yaml.safe_dump(opt_no_augs, f, sort_keys=False)
 
     # Loggers
     data_dict = None
@@ -121,6 +124,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+
+        if opt.pretrained:
+            ckpt = {
+                'epoch': -1, 'model': ckpt, 'ema': None, 
+                'updates': None, 'optimizer': None, 'wandb_id': None, 
+                'training_results': None
+            }
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
@@ -520,27 +530,40 @@ def parse_opt(known=False):
 
     # Dockerization argument
     parser.add_argument('--yaml_conf', action='store_true', help='to use config.yaml inside config folder')
+    parser.add_argument('--pretrained', action='store_true', help='to use config.yaml inside config folder')
 
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 
 
-@hydra.main(config_path="config", config_name="config")
-def retrieve_yaml_conf(cfg: DictConfig) -> None:
-    config = OmegaConf.structured(cfg)
-    return config
+
+def retrieve_yaml_conf():
+    with initialize(config_path="config"):
+        cfg = compose(config_name="config")
+    return cfg
 
 
-def overwrite_opts(opt, cfg):
-    training_dict = cfg['train']
+def overwrite_opts(opt):
+    # Temporary convert Namespace to dictionary
+    tmp = vars(opt)
+    cfg = retrieve_yaml_conf()
 
+    training_dict = cfg['training']
     for k, v in training_dict.items():
-        opt[k] = v 
+        tmp[k] = v 
 
-    opt['augmentations'] = cfg['augmentations']
+    # Add augmentations
+    if cfg['augmentations']:
+        tmp['augmentations'] = cfg['augmentations']
+    return argparse.Namespace(**tmp)
 
 
 def main(opt, callbacks=Callbacks()):
+
+    # If override using YAML
+    if opt.yaml_conf:
+         opt = overwrite_opts(opt)
+
     # Checks
     if RANK in (-1, 0):
         print_args(vars(opt))
@@ -567,15 +590,10 @@ def main(opt, callbacks=Callbacks()):
             opt.name = Path(opt.cfg).stem  # use model.yaml as name
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
-    # Configuration
-    if opt.yaml_conf:
-        config = retrieve_yaml_conf()
-        overwrite_opts(opt, config)
-
     # Fitness
     # See utils.metrics.fitness 
     default_fitness = [0.0, 0.0, 0.1, 0.9]
-    model_fitness = opt.get('fitness', default_fitness)
+    model_fitness = opt.fitness if 'fitness' in opt else default_fitness
     opt.fitness = list(model_fitness)
 
     # DDP mode
