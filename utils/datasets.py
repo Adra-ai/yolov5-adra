@@ -410,7 +410,8 @@ class LoadImagesAndLabels(Dataset):
                  single_cls=False,
                  stride=32,
                  pad=0.0,
-                 prefix=''):
+                 prefix='',
+                 opt={}):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
@@ -420,7 +421,10 @@ class LoadImagesAndLabels(Dataset):
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
-        self.albumentations = Albumentations() if augment else None
+
+        # Use albumentations from hydra conf
+        transforms = opt.get('augmentations', None)
+        self.albumentations = Albumentations(transforms=transforms) if augment else None
 
         try:
             f = []  # image files
