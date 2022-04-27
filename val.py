@@ -41,9 +41,13 @@ from utils.datasets import create_dataloader
 from utils.general import (LOGGER, check_dataset, check_img_size, check_requirements, check_yaml,
                            coco80_to_coco91_class, colorstr, increment_path, non_max_suppression, print_args,
                            scale_coords, xywh2xyxy, xyxy2xywh)
-from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
+from utils.metrics import ConfusionMatrix, ap_per_class, box_iou, box_cdist
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, time_sync
+
+
+OLD_EVAL_MODE = 1
+NEW_EVAL_MODE = 2
 
 
 def save_one_txt(predn, save_conf, shape, file):
@@ -69,17 +73,55 @@ def save_one_json(predn, jdict, path, class_map):
             'score': round(p[4], 5)})
 
 
-def process_batch(detections, labels, iouv):
+def score_cdist(cdist, cdist_threshold, min_iou):
+    """
+    Score centroid distance from 0 to 1
+    * if centroid distance between detection and label is 0, score will be 1
+    * if distance is exactly cdist_threshold, score will be min_iou
+    * if distance is larger than cdist_threshold, score will be 0
+    arg:
+        cdist (torch.tensor): MxN tensor of the centroid distance between M detections and N labels
+        min_iou (float): the iou thresold for a correct detection
+    returns:
+        cdist_scaled (torch.tensor)
+    """
+    dist_mask = (cdist < cdist_threshold)
+
+    # rescale centroid distance by the threshold
+    cdist_scaled = (1 - cdist / cdist_threshold)
+
+    # rescale distance to range (min_iou, 1) such that if distance criterion is met, the min IOU threshold will be met
+    cdist_score = cdist_scaled * (1 - min_iou) + min_iou
+
+    # masking out distance larger than threshold
+    return cdist_score * dist_mask
+
+
+def process_batch(detections, labels, iouv, cdist_thr=20, eval_mode=OLD_EVAL_MODE):
     """
     Return correct predictions matrix. Both sets of boxes are in (x1, y1, x2, y2) format.
     Arguments:
         detections (Array[N, 6]), x1, y1, x2, y2, conf, class
         labels (Array[M, 5]), class, x1, y1, x2, y2
+        cdist_thr (int): Centroid Distance Threshold for new evaluation mode	
+        eval_mode (int)	
+            Two evaluation modes:	
+                1: original YOLOv5 evaluation	
+                2: modified YOLOv5 evaluation for Adra dataset
     Returns:
         correct (Array[N, 10]), for 10 IoU levels
     """
     correct = torch.zeros(detections.shape[0], iouv.shape[0], dtype=torch.bool, device=iouv.device)
     iou = box_iou(labels[:, 1:], detections[:, :4])
+
+    if eval_mode == NEW_EVAL_MODE:	
+        # calculate iou, and the centroid distance score	
+        cdist = box_cdist(labels[:, 1:], detections[:, :4])	
+        cdist_score = score_cdist(cdist, cdist_thr, iouv[0])	
+        # take the max of iou and centroid distance score	
+        iou = torch.max(iou, cdist_score)
+
+
     x = torch.where((iou >= iouv[0]) & (labels[:, 0:1] == detections[:, 5]))  # IoU above threshold and classes match
     if x[0].shape[0]:
         matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detection, iou]
@@ -122,6 +164,8 @@ def run(
         plots=True,
         callbacks=Callbacks(),
         compute_loss=None,
+        eval_mode=OLD_EVAL_MODE,	
+        cdist_thr=20,
 ):
     # Initialize/load model and set device
     training = model is not None
@@ -159,6 +203,7 @@ def run(
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
+    cdist_thr = torch.Tensor([cdist_thr]).to(device)
 
     # Dataloader
     if not training:
@@ -352,6 +397,8 @@ def parse_opt():
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
+    parser.add_argument('--eval_mode', type=int, default=1, help='evaluation mode (0 - original, 1 - new)')
+    parser.add_argument('--cdist_thr', type=int, default=20, help='centroid distance threshold (default 20)')
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith('coco.yaml')
